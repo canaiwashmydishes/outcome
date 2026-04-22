@@ -1,0 +1,230 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default deny everything.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ========================================================================
+    // Helpers
+    // ========================================================================
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    /**
+     * Is the signed-in user an active member of the given team?
+     * The membership doc lives at teams/{teamId}/members/{uid}.
+     */
+    function isTeamMember(teamId) {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/teams/$(teamId)/members/$(request.auth.uid))
+        && get(/databases/$(database)/documents/teams/$(teamId)/members/$(request.auth.uid)).data.status == 'active';
+    }
+
+    /**
+     * Does the signed-in user hold one of the roles listed on the team?
+     */
+    function hasTeamRole(teamId, roles) {
+      return isSignedIn()
+        && isTeamMember(teamId)
+        && get(/databases/$(database)/documents/teams/$(teamId)/members/$(request.auth.uid)).data.role in roles;
+    }
+
+    /** Can the user see a given deal? (i.e. is a member of its team) */
+    function canReadDeal(dealId) {
+      return isTeamMember(get(/databases/$(database)/documents/deals/$(dealId)).data.teamId);
+    }
+
+    /** Can the user write to a given deal? (partner or associate on its team) */
+    function canWriteDeal(dealId) {
+      return hasTeamRole(
+        get(/databases/$(database)/documents/deals/$(dealId)).data.teamId,
+        ['partner', 'associate']
+      );
+    }
+
+    // ========================================================================
+    // USERS — read self only. Writes are server-only via callables.
+    // ========================================================================
+
+    match /users/{uid} {
+      allow read: if isSelf(uid);
+      allow write: if false;
+
+      // Integrations — per-user provider connections. Tokens live here for
+      // Build B2; Build G migrates to Secret Manager with per-user keys.
+      // Only the owning user can read their own integration state, and the
+      // read excludes nothing server-side (the token field is present but
+      // Firestore rules can't selectively hide fields; the web SDK should
+      // project to exclude tokens when displaying, and in Build G we move
+      // them off-doc entirely).
+      match /integrations/{provider} {
+        allow read: if isSelf(uid);
+        allow write: if false;
+      }
+    }
+
+    // ========================================================================
+    // TEAMS — members read the team doc. Membership subcollection is read
+    // by team members; updates are server-only.
+    // ========================================================================
+
+    match /teams/{teamId} {
+      allow read: if isTeamMember(teamId);
+      allow write: if false;
+
+      match /members/{memberUid} {
+        allow read: if isTeamMember(teamId);
+        allow write: if false;
+      }
+
+      // Invitations — pending invites are readable by the invited user
+      // (email match) so they can see what's pending, and by team partners
+      // so they can manage them. Writes are server-only via callables.
+      match /invitations/{invitationId} {
+        allow read: if isSignedIn()
+                    && (
+                      hasTeamRole(teamId, ['partner'])
+                      || (
+                        request.auth.token.email != null
+                        && resource.data.email == request.auth.token.email
+                      )
+                    );
+        allow write: if false;
+      }
+    }
+
+    // ========================================================================
+    // SUBSCRIPTIONS — members can read their team's subscription. Writes
+    // are server-only (Stripe webhook + entitlement adjustments).
+    // ========================================================================
+
+    match /subscriptions/{subscriptionId} {
+      allow read: if isSignedIn()
+                  && isTeamMember(resource.data.teamId);
+      allow write: if false;
+    }
+
+    // ========================================================================
+    // DEALS — team-scoped. Create goes through Cloud Function so the
+    // subscription quota can be checked atomically.
+    // Read is allowed to any active team member.
+    // Client updates are restricted to cosmetic fields (meta.name).
+    // ========================================================================
+
+    match /deals/{dealId} {
+      allow read: if isSignedIn()
+                  && isTeamMember(resource.data.teamId);
+
+      allow create: if false; // server-side via createDeal callable
+      allow delete: if false; // server-side via archiveDeal callable
+
+      // Allow only name rename by partners/associates; everything else
+      // is server-managed.
+      allow update: if isSignedIn()
+                    && hasTeamRole(resource.data.teamId, ['partner', 'associate'])
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                       .hasOnly(['meta', 'updatedAt'])
+                    && request.resource.data.meta.diff(resource.data.meta).affectedKeys()
+                       .hasOnly(['name']);
+
+      // ----- Documents (Phase 1) -----
+      match /documents/{docId} {
+        allow read: if isSignedIn() && canReadDeal(dealId);
+        allow write: if false; // server-only via ingestion pipeline
+      }
+
+      // ----- Issues (Phase 3 pre-flag) -----
+      match /issues/{issueId} {
+        allow read: if isSignedIn() && canReadDeal(dealId);
+        allow write: if false;
+      }
+
+      // ----- Findings (Phase 4) -----
+      match /findings/{findingId} {
+        allow read: if isSignedIn() && canReadDeal(dealId);
+
+        // Status and ownership changes go through callables so the audit
+        // log is always written in the same transaction. No direct client
+        // updates.
+        allow write: if false;
+      }
+
+      // ----- Follow-ups (Phase 5) -----
+      match /followups/{followupId} {
+        allow read: if isSignedIn() && canReadDeal(dealId);
+        allow write: if false;
+      }
+
+      // ----- Scenarios (Phase 6) -----
+      match /scenarios/{scenarioId} {
+        allow read: if isSignedIn() && canReadDeal(dealId);
+        allow write: if false;
+      }
+
+      // ----- Exports (Phase 7) -----
+      match /exports/{exportId} {
+        allow read: if isSignedIn() && canReadDeal(dealId);
+        allow write: if false;
+      }
+
+      // ----- Integration imports (Build B2) — team members can read their
+      // import jobs' status; writes are server-only. -----
+      match /imports/{importId} {
+        allow read: if isSignedIn() && canReadDeal(dealId);
+        allow write: if false;
+      }
+
+      // ----- Deal-scoped chat -----
+      match /messages/{messageId} {
+        allow read: if isSignedIn() && canReadDeal(dealId);
+        allow write: if false; // server-side via dealChat callable
+      }
+
+      // ----- Audit log — write-once, never update or delete from client -----
+      match /auditLog/{eventId} {
+        allow read: if isSignedIn() && canReadDeal(dealId);
+        allow create, update, delete: if false;
+      }
+    }
+
+    // ========================================================================
+    // TEAM-LEVEL AUDIT LOG — cross-deal audit events (member invitations,
+    // role changes). Still read-only and server-owned.
+    // ========================================================================
+
+    match /teamAuditLog/{eventId} {
+      allow read: if isSignedIn()
+                  && isTeamMember(resource.data.teamId);
+      allow write: if false;
+    }
+
+    // ========================================================================
+    // VDR ACCESS REQUESTS — server-only. Admin UI reads via admin SDK.
+    // ========================================================================
+
+    match /vdrAccessRequests/{requestId} {
+      allow read, write: if false;
+    }
+
+    // ========================================================================
+    // STRIPE WEBHOOK EVENTS — server-only, used for idempotency.
+    // ========================================================================
+
+    match /stripe_events/{eventId} {
+      allow read, write: if false;
+    }
+  }
+}

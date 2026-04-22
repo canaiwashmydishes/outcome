@@ -1,0 +1,25 @@
+{
+  "name": "outcome99",
+  "version": "0.1.0",
+  "private": true,
+  "description": "High-concurrency AI simulation platform for Private Equity stress testing.",
+  "workspaces": [
+    "apps/*",
+    "functions",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "build:shared": "npm run build --workspace=@outcome99/shared",
+    "build:web": "npm run build --workspace=@outcome99/web",
+    "build:functions": "npm run build --workspace=functions",
+    "dev:web": "npm run dev --workspace=@outcome99/web",
+    "dev:functions": "npm run dev --workspace=functions",
+    "emulators": "firebase emulators:start",
+    "lint": "npm run lint --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
